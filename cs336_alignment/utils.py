@@ -177,6 +177,109 @@ def masked_normalize(
     return masked.sum(dim=dim) / normalize_constant
 
 
+def masked_mean(
+    tensor: torch.Tensor,
+    mask: torch.Tensor,
+    dim: int | None = None,
+) -> torch.Tensor:
+    """Mean over masked elements along a dimension."""
+    tensor = tensor * mask
+    if dim is not None:
+        return tensor.sum(dim=dim) / mask.sum(dim=dim)
+    return tensor.sum() / mask.sum()
+
+
+def compute_group_normalized_rewards(
+    reward_fn,
+    rollout_responses: list[str],
+    repeated_ground_truths: list[str],
+    group_size: int,
+    advantage_eps: float = 1e-6,
+    normalize_by_std: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    """Compute rewards and group-normalize them (GRPO advantage computation)."""
+    raw_rewards = []
+    for r, t in zip(rollout_responses, repeated_ground_truths):
+        raw_rewards.append(reward_fn(r, t)["reward"])
+    raw_rewards = torch.tensor(raw_rewards, dtype=torch.float32)
+    n_groups = len(rollout_responses) // group_size
+
+    grouped = raw_rewards.view(n_groups, group_size)
+    mean_r = grouped.mean(dim=1, keepdim=True)
+    normalized_rewards = grouped - mean_r
+    metadata = {"max": raw_rewards.max().item()}
+    if normalize_by_std:
+        std = grouped.std(dim=1, keepdim=True) + advantage_eps
+        normalized_rewards = normalized_rewards / std
+    return normalized_rewards.view(-1), raw_rewards, metadata
+
+
+def compute_naive_policy_gradient_loss(
+    raw_rewards_or_advantages: torch.Tensor,
+    policy_log_probs: torch.Tensor,
+) -> torch.Tensor:
+    """Basic policy gradient loss: -reward * log_prob."""
+    return -raw_rewards_or_advantages * policy_log_probs
+
+
+def compute_grpo_clip_loss(
+    advantages: torch.Tensor,
+    policy_log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    cliprange: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Clipped policy gradient loss (PPO/GRPO-style)."""
+    reweight = torch.exp(policy_log_probs) / torch.exp(old_log_probs)
+    loss = -torch.min(
+        reweight * advantages,
+        torch.clamp(reweight, min=1 - cliprange, max=1 + cliprange) * advantages,
+    )
+    metadata = {
+        "clip_rate": ((reweight > 1 + cliprange) | (reweight < 1 - cliprange)).float().mean().item()
+    }
+    return loss, metadata
+
+
+def compute_policy_gradient_loss(
+    policy_log_probs: torch.Tensor,
+    loss_type: str,
+    raw_rewards: torch.Tensor | None = None,
+    advantages: torch.Tensor | None = None,
+    old_log_probs: torch.Tensor | None = None,
+    cliprange: float = 0.2,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Dispatcher for policy gradient loss types."""
+    if loss_type == "no_baseline":
+        loss = compute_naive_policy_gradient_loss(raw_rewards, policy_log_probs)
+        return loss, {}
+    elif loss_type == "reinforce_with_baseline":
+        loss = compute_naive_policy_gradient_loss(advantages, policy_log_probs)
+        return loss, {}
+    elif loss_type == "grpo_clip":
+        return compute_grpo_clip_loss(advantages, policy_log_probs, old_log_probs, cliprange)
+    else:
+        raise ValueError(f"Unknown loss_type: {loss_type}")
+
+
+def grpo_microbatch_train_step(
+    policy_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    gradient_accumulation_steps: int,
+    loss_type: str,
+    raw_rewards: torch.Tensor | None = None,
+    advantages: torch.Tensor | None = None,
+    old_log_probs: torch.Tensor | None = None,
+    cliprange: float | None = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Compute GRPO loss and call backward for one microbatch."""
+    loss, metadata = compute_policy_gradient_loss(
+        policy_log_probs, loss_type, raw_rewards, advantages, old_log_probs, cliprange
+    )
+    loss = masked_mean(loss, response_mask) / gradient_accumulation_steps
+    loss.backward()
+    return loss, metadata
+
+
 def sft_microbatch_train_step(
     policy_log_probs: torch.Tensor,
     response_mask: torch.Tensor,
