@@ -336,6 +336,120 @@ class EITrainer:
             "eval/answer_reward": avg_answer,
         }
 
+    def evaluate_full(self, reward_fn: Callable | None = None) -> dict:
+        """Run evaluation on the full val set and produce a detailed report."""
+        if reward_fn is None:
+            reward_fn = r1_zero_reward_fn
+
+        eval_prompts = []
+        ground_truths = []
+        problems = []
+        for ex in self.val_data:
+            q = ex.get("question", ex.get("problem", ""))
+            a = str(ex.get("answer", ex.get("expected_answer", "")))
+            eval_prompts.append(self.prompt_template.format(question=q))
+            ground_truths.append(a)
+            problems.append(q)
+
+        sampling_params = SamplingParams(
+            temperature=1.0,
+            max_tokens=self.sampling_max_tokens,
+            min_tokens=self.sampling_min_tokens,
+        )
+        sampling_params.stop = ["</answer>"]
+        sampling_params.include_stop_str_in_output = True
+
+        single_gpu = torch.cuda.device_count() <= 1
+        if single_gpu:
+            self.policy.cpu()
+            torch.cuda.empty_cache()
+
+        eval_device = "cuda:0" if single_gpu else "cuda:1"
+        llm = init_vllm(
+            model_id=self.model_path,
+            device=eval_device,
+            seed=42,
+            gpu_memory_utilization=0.85 if single_gpu else 0.4,
+        )
+        load_policy_into_vllm_instance(self.policy, llm)
+
+        raw_outputs = llm.generate(eval_prompts, sampling_params)
+
+        results = []
+        for output, ex, gt in zip(raw_outputs, self.val_data, ground_truths):
+            generation = output.outputs[0].text
+            scores = reward_fn(generation, gt)
+            results.append({
+                "problem": ex.get("question", ex.get("problem", "")),
+                "expected_answer": gt,
+                "output": generation,
+                "reward": {
+                    "reward": scores["reward"],
+                    "format_reward": scores["format_reward"],
+                    "answer_reward": scores["answer_reward"],
+                },
+            })
+
+        del llm
+        torch.cuda.empty_cache()
+
+        if single_gpu:
+            self.policy.to(self.device)
+
+        avg_acc = mean(r["reward"]["answer_reward"] for r in results)
+        avg_format_acc = mean(r["reward"]["format_reward"] for r in results)
+        avg_reward = mean(r["reward"]["reward"] for r in results)
+
+        output_path = Path(self.output_dir) / "math_eval_results.json"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "results": results,
+            "accuracy": {
+                "avg_acc": round(avg_acc, 4),
+                "avg_format_acc": round(avg_format_acc, 4),
+            },
+        }
+        with open(output_path, "w") as f:
+            json.dump(data, f, indent=2)
+        logger.info(f"Wrote {len(results)} results to {output_path}")
+
+        correct, wrong_answer, bad_format = [], [], []
+        for r in results:
+            fmt = r["reward"]["format_reward"]
+            ans = r["reward"]["answer_reward"]
+            if fmt == 1.0 and ans == 1.0:
+                correct.append(r)
+            elif fmt == 1.0 and ans == 0.0:
+                wrong_answer.append(r)
+            else:
+                bad_format.append(r)
+
+        total = len(results)
+        n_examples = 5
+        print("\n=== MATH Evaluation Results (Post-EI) ===")
+        print(f"Total examples : {total}")
+        print(f"Correct        (fmt=1, ans=1): {len(correct):5d}  ({100 * len(correct) / total:.1f}%)")
+        print(f"Wrong answer   (fmt=1, ans=0): {len(wrong_answer):5d}  ({100 * len(wrong_answer) / total:.1f}%)")
+        print(f"Bad format     (fmt=0, ans=0): {len(bad_format):5d}  ({100 * len(bad_format) / total:.1f}%)")
+        print(f"Average reward : {avg_reward:.4f}")
+
+        for label, examples in [
+            ("Correct (format=1, answer=1)", correct),
+            ("Wrong answer (format=1, answer=0)", wrong_answer),
+            ("Bad format (format=0, answer=0)", bad_format),
+        ]:
+            print(f"\n{'='*70}")
+            print(f"  {label}  ({len(examples)} total, showing {min(n_examples, len(examples))})")
+            print(f"{'='*70}")
+            for i, ex in enumerate(examples[:n_examples]):
+                print(f"\n--- Example {i+1} ---")
+                print(f"Problem:  {ex['problem'][:200]}")
+                print(f"Expected: {ex['expected_answer']}")
+                print(f"Output:   {ex['output'][:400]}")
+                print(f"Rewards:  format={ex['reward']['format_reward']}  answer={ex['reward']['answer_reward']}")
+
+        return data
+
     def _wandb_config(self) -> dict:
         skip = {"policy", "tokenizer", "prompt_template", "train_data", "val_data"}
         return {k: v for k, v in self.__dict__.items() if k not in skip}
@@ -399,6 +513,20 @@ class EITrainer:
         self.policy.save_pretrained(final_path)
         self.tokenizer.save_pretrained(final_path)
         logger.info(f"Saved final model to {final_path}")
+
+        # Final evaluation on full val set with detailed report
+        if self.val_data:
+            logger.info("Running final MATH evaluation on full val set...")
+            self.policy.eval()
+            report = self.evaluate_full(reward_fn)
+            final_metrics = {
+                "eval/reward": mean(r["reward"]["reward"] for r in report["results"]),
+                "eval/format_reward": mean(r["reward"]["format_reward"] for r in report["results"]),
+                "eval/answer_reward": mean(r["reward"]["answer_reward"] for r in report["results"]),
+            }
+            if self.use_wandb:
+                import wandb
+                wandb.log({**final_metrics, "ei_step": self.n_ei_steps + 1})
 
         if self.use_wandb:
             import wandb

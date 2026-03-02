@@ -73,7 +73,7 @@ def run_inference(
     results = []
     for output, example in zip(raw_outputs, val_data):
         generation = output.outputs[0].text
-        scores = r1_zero_reward_fn(generation, str(example["expected_answer"]))
+        scores = r1_zero_reward_fn(generation, example["expected_answer"])
         results.append({
             "problem": example["problem"],
             "expected_answer": example["expected_answer"],
